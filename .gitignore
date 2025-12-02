@@ -5,3 +5,16 @@ data/processed/images/*
 *.png
 data/processed/metadata_10k.csv
 .env
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Data (Cap3D assets, metadata, etc.)
+data/
+
+# macOS
+.DS_Store
