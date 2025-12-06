@@ -9,6 +9,7 @@ Code does the following:
 """
 
 import os
+import json
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
@@ -19,6 +20,7 @@ import faiss
 FAISS_INDEX_PATH = "data/index/text_index.faiss"
 METADATA_PATH = "data/index/text_index_metadata.csv"
 MODEL_NAME = "all-MiniLM-L6-v2"
+TESTS_JSON_PATH = "data/tests/baseline_robustness_tests.json"
 TOP_K_DEFAULT = 10
 
 
@@ -191,62 +193,151 @@ def evaluate_random_subset(
     return metrics
 
 
-def run_robustness_tests(index, meta_df, model):
+def run_robustness_tests(index, meta_df, model, tests_path, top_ks=(1, 5, 10)):
     """
-    run a small robustness test with:
-        - synonym substitutions
-        - added adjectives
-        - word reordering
-    (single concept: sofa)
-    """
-    tests = [
-        {
-            "name": "sofa",
-            "orig": "white sofa with wooden legs",
-            "variants": [
-                "white couch with wooden legs",            # synonym
-                "comfortable white sofa with wooden legs", # added adjective
-                "sofa with wooden legs that is white",     # changed order
-            ],
-        },
-    ]
+    Run robustness tests over a set of query families.
 
-    print("\n" + "=" * 80)
-    print("[INFO] Running robustness test (synonyms / wording changes)...")
+    tests: list of dicts, each like:
+        {
+            "name": str,
+            "orig": str,
+            "orig_type": str (optional, default "canonical"),
+            "variants": [
+                {"query": str, "type": str},
+                ...
+            ]
+        }
+
+    For each test:
+      1. Use original query to define target UID (top-1 result).
+      2. For original + each variant:
+         - Run search with top_k = max(top_ks).
+         - Find rank of target UID if present.
+         - Classify as R@1, R@5, R@10, or miss.
+
+    Returns:
+      results: list of dicts with keys:
+        - test_name
+        - query_type
+        - variant_label
+        - variant_type
+        - query
+        - rank
+        - success_level
+    """
+    
+    with open(tests_path, "r", encoding="utf-8") as f:
+        tests = json.load(f)
+
+
+    max_k = max(top_ks)
+    top_ks_sorted = sorted(top_ks)
+
+    def classify_rank(rank):
+        if rank is None:
+            return "miss"
+        for k in top_ks_sorted:
+            if rank <= k:
+                return f"R@{k}"
+        return "miss"
+
+    results = []
+
+    def evaluate_query(query, query_type, variant_label, variant_type, target_uid, test_name):
+        res = search(index, meta_df, model, query, top_k=max_k)
+
+        rank = None
+        for r in res:
+            if r["uid"] == target_uid:
+                rank = r["rank"]
+                break
+
+        success = classify_rank(rank)
+
+        results.append(
+            {
+                "test_name": test_name,
+                "query_type": query_type,        # "orig" or "variant"
+                "variant_label": variant_label,  # "orig" or the variant query
+                "variant_type": variant_type,    # e.g. "typo", "hypernym", etc.
+                "query": query,
+                "rank": rank,
+                "success_level": success,
+            }
+        )
+
+        return rank, success
+
+    print("[INFO] Running robustness tests (R@1 / R@5 / R@10)...")
 
     for test in tests:
-        orig = test["orig"]
-        variants = test["variants"]
+        name = test.get("name", "UNKNOWN_TEST")
+        orig_query = test["orig"]
+        orig_type = test.get("orig_type", "canonical")
+        variants = test.get("variants", [])
 
-        print("\n" + "-" * 80)
-        print(f"  Original query: {orig}")
+        print("\n" + "-" * 80+"\n")
+        print(f"[TEST] {name}")
+        print(f"  Original query: {orig_query}")
 
-        orig_results = search(index, meta_df, model, orig, top_k=5)
+        # determine target UID from original query (top-1 result)
+        orig_results = search(index, meta_df, model, orig_query, top_k=max_k)
         orig_top = orig_results[0]
-        orig_uid = orig_top["uid"]
+        target_uid = orig_top["uid"]
         print(
             "  [ORIG TOP-1] uid={}  score={:.4f}".format(
-                orig_uid, orig_top["score"]
+                target_uid, orig_top["score"]
             )
         )
         print("               caption: {}".format(orig_top["caption"]))
 
-        for v in variants:
-            sim = cosine_similarity(model, orig, v)
-            v_results = search(index, meta_df, model, v, top_k=5)
-            v_top = v_results[0]
-            same_uid = (v_top["uid"] == orig_uid)
+        # evaluate original query
+        orig_rank, orig_level = evaluate_query(
+            query=orig_query,
+            query_type="orig",
+            variant_label="orig",
+            variant_type=orig_type,
+            target_uid=target_uid,
+            test_name=name,
+        )
+        print(f"\n  => Original: success={orig_level}  rank={orig_rank}  type={orig_type}")
 
-            print("\n    Variant query: {}".format(v))
-            print("      cosine_sim(orig, variant) = {:.4f}".format(sim))
-            print(
-                "      [VAR TOP-1] uid={}  score={:.4f}".format(
-                    v_top["uid"], v_top["score"]
+        # pretty print variants in a table-like format
+        if variants:
+            print("\n  Variants:")
+            # header
+            print("    {succ:<7}  {rank:<4}  {vtype:<20}  {query}".format(
+                succ="success",
+                rank="rank",
+                vtype="type",
+                query="query",
+            ))
+            print("    {:-<7}  {:-<4}  {:-<20}  {:-<40}".format("", "", "", ""))
+
+            for v in variants:
+                q = v["query"]
+                v_type = v.get("type", "unknown")
+
+                rank_v, level_v = evaluate_query(
+                    query=q,
+                    query_type="variant",
+                    variant_label=q,
+                    variant_type=v_type,
+                    target_uid=target_uid,
+                    test_name=name,
                 )
-            )
-            print("                  caption: {}".format(v_top["caption"]))
-            print("      Top-1 same as original? {}".format(same_uid))
 
+                rank_str = "-" if rank_v is None else str(rank_v)
+                print(
+                    "    {succ:<7}  {rank:<4}  {vtype:<20}  {query}".format(
+                        succ=level_v,
+                        rank=rank_str,
+                        vtype=v_type[:20],
+                        query=q,
+                    )
+                )
+
+    return results
 
 def main():
     # load index, metadata, and text encoder
@@ -285,8 +376,7 @@ def main():
     print("  MRR  = {:.3f}".format(metrics["MRR"]))
 
     # small robustness check
-    run_robustness_tests(index, meta_df, model)
-
+    run_robustness_tests(index, meta_df, model, TESTS_JSON_PATH)
 
 if __name__ == "__main__":
     main()
