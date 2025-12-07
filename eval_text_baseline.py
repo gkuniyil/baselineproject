@@ -20,7 +20,7 @@ import faiss
 FAISS_INDEX_PATH = "data/index/text_index.faiss"
 METADATA_PATH = "data/index/text_index_metadata.csv"
 MODEL_NAME = "all-MiniLM-L6-v2"
-TESTS_JSON_PATH = "data/tests/baseline_robustness_tests.json"
+TESTS_JSON_PATH = "tests/baseline_robustness_tests.json"
 TOP_K_DEFAULT = 10
 
 
