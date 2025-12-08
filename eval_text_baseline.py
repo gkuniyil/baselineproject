@@ -1,13 +1,3 @@
-"""
-Evaluate the unsupervised text retrieval baseline.
-
-Code does the following:
-    1. Load the FAISS index and metadata from disk.
-    2. Load the MiniLM text encoder used to build the index.
-    3. Provide a helper function `search(query, top_k)` that returns
-       the top-k (idx, uid, caption, score) for a given text query.
-"""
-
 import os
 import json
 import numpy as np
@@ -79,6 +69,49 @@ def cosine_similarity(model, q1: str, q2: str) -> float:
     # since they are normalized, cosine = dot product
     sim = float(np.dot(emb1[0], emb2[0]))
     return sim
+
+
+def compute_cosine_similarity_drop(
+    model,
+    original_queries: list,
+    perturbed_queries: list
+) -> dict:
+    """
+    Compute cosine similarity drop between original and perturbed queries.
+    
+    Args:
+        model: SentenceTransformer model
+        original_queries: List of original query strings
+        perturbed_queries: List of perturbed query strings (same length)
+    
+    Returns:
+        {
+            'similarities': list of floats,
+            'mean_similarity': float,
+            'mean_drop': float (1 - mean_similarity),
+            'std_similarity': float,
+            'min_similarity': float,
+            'max_similarity': float
+        }
+    """
+    if len(original_queries) != len(perturbed_queries):
+        raise ValueError("Query lists must have same length")
+    
+    similarities = []
+    for orig, pert in zip(original_queries, perturbed_queries):
+        sim = cosine_similarity(model, orig, pert)
+        similarities.append(sim)
+    
+    similarities = np.array(similarities)
+    
+    return {
+        'similarities': similarities.tolist(),
+        'mean_similarity': float(np.mean(similarities)),
+        'mean_drop': float(1.0 - np.mean(similarities)),
+        'std_similarity': float(np.std(similarities)),
+        'min_similarity': float(np.min(similarities)),
+        'max_similarity': float(np.max(similarities))
+    }
 
 
 def search(index, meta_df, model, query: str, top_k: int = TOP_K_DEFAULT):
@@ -153,6 +186,7 @@ def evaluate_random_subset(
     r_at_5 = 0
     r_at_10 = 0
     mrr_sum = 0.0
+    individual_scores = []
 
     for count, idx in enumerate(sampled_indices, start=1):
         row = meta_df.iloc[idx]
@@ -167,6 +201,16 @@ def evaluate_random_subset(
             if r["uid"] == true_uid:
                 rank_of_true = r["rank"]
                 break
+
+        individual_scores.append({
+            'query': query_caption,
+            'true_uid': true_uid,
+            'rank': rank_of_true,
+            'found_in_top1': rank_of_true == 1 if rank_of_true else False,
+            'found_in_top5': rank_of_true <= 5 if rank_of_true else False,
+            'found_in_top10': rank_of_true <= 10 if rank_of_true else False,
+            'reciprocal_rank': 1.0 / rank_of_true if rank_of_true else 0.0
+        })
 
         if rank_of_true is not None:
             if rank_of_true <= 1:
@@ -189,8 +233,69 @@ def evaluate_random_subset(
         "R@10": r_at_10 / num,
         "MRR": mrr_sum / num,
         "num_samples": num_samples,
+        "individual_scores": individual_scores,
     }
     return metrics
+
+
+def compute_robustness_ratio(
+    index,
+    meta_df,
+    model,
+    original_queries: list,
+    perturbed_queries: list,
+    ground_truth_uids: list,
+    k_values: list = [1, 5, 10]
+) -> dict:
+    """
+    Compute Robustness Ratio: RR = R@k(perturbed) / R@k(original).
+    
+    Args:
+        index: FAISS index
+        meta_df: Metadata DataFrame
+        model: SentenceTransformer model
+        original_queries: List of original query strings
+        perturbed_queries: List of perturbed versions (same length)
+        ground_truth_uids: List of correct UIDs for each query
+        k_values: List of k values to test (default: [1, 5, 10])
+    
+    Returns:
+        {
+            'original': {'R@1': float, 'R@5': float, 'R@10': float},
+            'perturbed': {'R@1': float, 'R@5': float, 'R@10': float},
+            'robustness_ratios': {'RR@1': float, 'RR@5': float, 'RR@10': float},
+            'num_queries': int
+        }
+    """
+    if len(original_queries) != len(perturbed_queries) != len(ground_truth_uids):
+        raise ValueError("All input lists must have same length")
+    
+    def compute_recall_at_k(queries, uids, k):
+        """Helper: compute R@k for a set of queries."""
+        hits = 0
+        for query, true_uid in zip(queries, uids):
+            results = search(index, meta_df, model, query, top_k=k)
+            if any(r['uid'] == true_uid for r in results):
+                hits += 1
+        return hits / len(queries) if queries else 0.0
+    
+    # Compute R@k for original and perturbed queries
+    results = {
+        'original': {},
+        'perturbed': {},
+        'robustness_ratios': {},
+        'num_queries': len(original_queries)
+    }
+    
+    for k in k_values:
+        r_orig = compute_recall_at_k(original_queries, ground_truth_uids, k)
+        r_pert = compute_recall_at_k(perturbed_queries, ground_truth_uids, k)
+        
+        results['original'][f'R@{k}'] = r_orig
+        results['perturbed'][f'R@{k}'] = r_pert
+        results['robustness_ratios'][f'RR@{k}'] = r_pert / r_orig if r_orig > 0 else 0.0
+    
+    return results
 
 
 def run_robustness_tests(index, meta_df, model, tests_path, top_ks=(1, 5, 10)):
@@ -270,6 +375,11 @@ def run_robustness_tests(index, meta_df, model, tests_path, top_ks=(1, 5, 10)):
 
     print("[INFO] Running robustness tests (R@1 / R@5 / R@10)...")
 
+    # Collect data for aggregate metrics
+    all_original_queries = []
+    all_variant_queries = []
+    all_target_uids = []
+
     for test in tests:
         name = test.get("name", "UNKNOWN_TEST")
         orig_query = test["orig"]
@@ -336,6 +446,47 @@ def run_robustness_tests(index, meta_df, model, tests_path, top_ks=(1, 5, 10)):
                         query=q,
                     )
                 )
+                
+                # Collect for aggregate metrics
+                all_original_queries.append(orig_query)
+                all_variant_queries.append(q)
+                all_target_uids.append(target_uid)
+
+    # Compute aggregate metrics after all tests
+    if all_variant_queries:
+        print("\n" + "=" * 80)
+        print("AGGREGATE METRICS (across all tests):")
+        print("=" * 80)
+        
+        # Compute δSim
+        delta_sim = compute_cosine_similarity_drop(
+            model,
+            all_original_queries,
+            all_variant_queries
+        )
+        
+        # Compute Robustness Ratio
+        rr_metrics = compute_robustness_ratio(
+            index, meta_df, model,
+            all_original_queries,
+            all_variant_queries,
+            all_target_uids,
+            k_values=[1, 5, 10]
+        )
+        
+        print(f"\nCosine Similarity Drop (δSim):")
+        print(f"  Mean similarity: {delta_sim['mean_similarity']:.4f}")
+        print(f"  Mean drop (δSim): {delta_sim['mean_drop']:.4f}")
+        print(f"  Std deviation:   {delta_sim['std_similarity']:.4f}")
+        print(f"  Range:           [{delta_sim['min_similarity']:.4f}, {delta_sim['max_similarity']:.4f}]")
+        
+        print(f"\nRobustness Ratio (RR):")
+        print(f"  Original R@1:  {rr_metrics['original']['R@1']:.3f}")
+        print(f"  Perturbed R@1: {rr_metrics['perturbed']['R@1']:.3f}")
+        print(f"  RR@1:          {rr_metrics['robustness_ratios']['RR@1']:.3f}")
+        print(f"  RR@5:          {rr_metrics['robustness_ratios']['RR@5']:.3f}")
+        print(f"  RR@10:         {rr_metrics['robustness_ratios']['RR@10']:.3f}")
+        print(f"  Total queries: {rr_metrics['num_queries']}")
 
     return results
 
